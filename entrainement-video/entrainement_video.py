@@ -1,10 +1,11 @@
 # %% [markdown]
-# # 🎬 Entraînement IA vidéo — mouvements « fumer »
+# # 🎬 Entraînement IA vidéo — gestes autour de la cigarette, style selfie
 #
 # Ce carnet fait **tout automatiquement**, du début à la fin :
 #
-# 1. il regarde toutes tes vidéos et repère seul les passages où la personne fume ;
-# 2. il les découpe en petits clips de 3 secondes et les décrit avec des mots ;
+# 1. il regarde toutes tes vidéos et repère seul les passages avec une cigarette
+#    (gestes, posture, attitude, allumer, tirer, souffler), en privilégiant les vidéos selfie ;
+# 2. il les découpe en petits clips et les décrit avec des mots (dont le cadrage selfie) ;
 # 3. il entraîne un module (LoRA) pour l'IA vidéo libre **Wan 2.1** (1,3 milliard de paramètres) ;
 # 4. il crée des vidéos test avec ce que l'IA a appris.
 #
@@ -14,6 +15,7 @@
 # - tes vidéos ajoutées avec **Add Input** (bouton à droite).
 #
 # Puis **Save Version → Save & Run All (Commit)**. Tu peux fermer la page : tout tourne seul (3 à 6 h).
+# (Le même code tourne aussi sur Modal, avec une carte graphique bien plus puissante : voir `modal_app.py`.)
 # Les résultats seront dans l'onglet **Output** de la version.
 #
 # Uniquement des vidéos libres de droits, avec des adultes consentants.
@@ -23,13 +25,17 @@
 #  RÉGLAGES — tu peux tout laisser tel quel.
 # ======================================================================
 MOT_CLE = "smkmotion"  # mot magique qui active le style appris
-DESCRIPTION_STYLE = "a person smoking a cigarette, inhaling and exhaling smoke"
+DESCRIPTION_STYLE = ("a person smoking a cigarette with natural gestures, relaxed posture and confident attitude, "
+                     "inhaling and exhaling smoke")
+PHRASE_SELFIE = ("selfie-style video, the person films themselves with a handheld phone or a phone on a tripod, "
+                 "looking into the camera")
 
 # Préparation des vidéos
-NB_CLIPS_MAX = 160          # nombre maximum de clips de 3 s utilisés pour apprendre
-CLIPS_MAX_PAR_VIDEO = 6     # pour varier les personnes et les situations
+NB_CLIPS_MAX = 240          # nombre maximum de clips utilisés pour apprendre
+CLIPS_MAX_PAR_VIDEO = 10    # plusieurs moments par vidéo, sans trop favoriser une seule personne
 SECONDES_ANALYSE_MAX = 900  # on analyse au plus les 15 premières minutes de chaque vidéo
-SEUIL_FUMER = 0.30          # 0 à 1 : à quel point l'IA doit être sûre que la personne fume
+SEUIL_FUMER = 0.20          # 0 à 1 : à quel point l'IA doit être sûre qu'une cigarette est présente
+BONUS_SELFIE = 0.5          # priorité donnée aux plans selfie (0 = aucune)
 
 # Entraînement
 ETAPES = 1600
@@ -43,9 +49,12 @@ FORMAT_TEST = "portrait"    # "portrait" (TikTok) ou "paysage"
 IMAGES_TEST = 49            # 49 images = 3 secondes, 81 = 5 secondes (plus long à créer)
 ETAPES_TEST = 30
 PROMPTS_TEST = [
-    "a woman with long dark hair sitting by a window, slowly takes a drag of her cigarette and exhales a cloud of smoke, calm confident attitude, soft daylight",
-    "a man in a black leather jacket leaning against a brick wall at night, lights a cigarette, inhales deeply and blows smoke upwards, cinematic",
-    "close-up of a woman with red lipstick, holding a cigarette to her lips, exhaling smoke slowly, film look, shallow depth of field",
+    "selfie-style video, a woman with long dark hair films herself with her phone on a tripod in her living room, "
+    "slowly takes a drag of her cigarette and exhales a cloud of smoke, relaxed posture, confident attitude, soft daylight",
+    "selfie-style video, a man in a black leather jacket holds his phone at arm's length on a balcony at night, "
+    "lights a cigarette, inhales deeply and blows smoke upwards, city lights behind him",
+    "selfie-style video, a woman with short blond hair sitting in her car films herself, holds a cigarette between her fingers, "
+    "takes a puff and exhales slowly through the open window, natural light",
 ]
 NEGATIF = (
     "bright tones, overexposed, static, blurred details, subtitles, style, works, paintings, images, static, "
@@ -62,11 +71,12 @@ import os, sys, subprocess, time, json, math, random, gc, glob, shutil
 
 DEBUT = time.time()
 TEST = os.environ.get("MANNEQUIN_TEST") == "1"  # mode simulation (utilisé pour vérifier le carnet)
+DUREE_MAX_HEURES = float(os.environ.get("MANNEQUIN_DUREE_MAX_HEURES", DUREE_MAX_HEURES))
 if TEST:
     NB_CLIPS_MAX, ETAPES, SAUVEGARDE_TOUTES, IMAGES_TEST, ETAPES_TEST = 12, 8, 4, 9, 2
     ETAPES = int(os.environ.get("MANNEQUIN_TEST_ETAPES", ETAPES))
 
-if not TEST:
+if not TEST and os.environ.get("MANNEQUIN_DEJA_INSTALLE") != "1":
     subprocess.run([sys.executable, "-m", "pip", "install", "-q",
                     "diffusers==0.42.1", "peft==0.21.2", "transformers==5.21.0",
                     "accelerate", "open_clip_torch", "ftfy", "sentencepiece", "imageio-ffmpeg"], check=True)
@@ -88,6 +98,27 @@ if DEVICE == "cuda":
     for i in range(torch.cuda.device_count()):
         print("✅ Carte graphique :", torch.cuda.get_device_name(i))
 torch.set_num_threads(os.cpu_count() or 4)
+
+# Grosse carte graphique (Modal : L40S 48 Go, A100…) => clips plus longs et plus nets
+MEMOIRE_GO = torch.cuda.get_device_properties(0).total_memory / 2**30 if DEVICE == "cuda" else 0
+GROS_GPU = MEMOIRE_GO >= 30 or (TEST and os.environ.get("MANNEQUIN_TEST_GROS") == "1")
+# Précision de calcul : bf16 si la carte le permet (plus stable), sinon fp16 (T4)
+_choix = os.environ.get("MANNEQUIN_TEST_PRECISION") if TEST else None
+if _choix:
+    PRECISION = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[_choix]
+elif DEVICE == "cuda":
+    PRECISION = torch.bfloat16 if torch.cuda.get_device_capability(0)[0] >= 8 else torch.float16
+else:
+    PRECISION = torch.float32
+AMP = PRECISION != torch.float32
+if GROS_GPU:
+    NB_CLIPS_MAX = max(NB_CLIPS_MAX, 300)
+    ETAPES = int(os.environ.get("MANNEQUIN_ETAPES", 2400))
+    IMAGES_TEST, ETAPES_TEST = 81, 40
+    if TEST:
+        NB_CLIPS_MAX, ETAPES, IMAGES_TEST, ETAPES_TEST = 12, 8, 17, 2
+print(f"⚙️ Mémoire carte : {MEMOIRE_GO:.0f} Go · précision : {str(PRECISION).replace('torch.', '')} · "
+      f"{'grande' if GROS_GPU else 'petite'} configuration")
 
 try:
     import imageio_ffmpeg
@@ -122,7 +153,7 @@ journal(f"🎞️ {len(VIDEOS)} vidéo(s) trouvée(s)")
 if not VIDEOS:
     raise SystemExit("❌ Aucune vidéo trouvée. Ajoute ton dataset de vidéos avec « Add Input », puis relance.")
 
-IMAGES_CLIP = 49   # 49 images à 16 images/s ≈ 3 secondes (format attendu par Wan)
+IMAGES_CLIP = 81 if GROS_GPU else 49   # 81 images ≈ 5 s, 49 ≈ 3 s, à 16 images/s (format attendu par Wan)
 FPS_CLIP = 16
 DUREE_CLIP = IMAGES_CLIP / FPS_CLIP
 FPS_ANALYSE = 2
@@ -180,31 +211,48 @@ def lire_images(chemin, debut, duree, fps, largeur, hauteur, nb_max=None):
 POSITIFS = ["a photo of a person smoking a cigarette",
             "a person exhaling cigarette smoke",
             "a close-up of a person holding a cigarette to their lips",
-            "a person lighting a cigarette"]
+            "a person lighting a cigarette",
+            "a person holding a lit cigarette between their fingers",
+            "a selfie of a person with a cigarette"]
 NEGATIFS = ["a photo of a person", "a photo of a room", "a photo of text on a screen",
-            "a blurry dark photo", "a photo of an object on a table", "a person talking to the camera"]
+            "a blurry dark photo", "a photo of an object on a table", "a person eating food"]
+SELFIE_OUI = ["a selfie video of a person filming themselves with a phone",
+              "a person holding a phone at arm's length, filming themselves",
+              "a person filming themselves with a phone on a tripod, looking at the camera"]
+SELFIE_NON = ["a video of a person filmed by someone else from a distance",
+              "a wide shot of a person who is not looking at the camera",
+              "a photo with no person in it"]
 
 def charger_clip():
     if TEST:
-        return lambda images: np.clip(images.reshape(len(images), -1).mean(1) / 255.0 * 1.6, 0, 1)
+        def faux(images):
+            m = images.reshape(len(images), -1).mean(1) / 255.0
+            return np.clip(m * 1.6, 0, 1), np.clip(1.2 - m, 0, 1)
+        return faux
     import open_clip
     modele, _, pretraitement = open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion2b_s34b_b79k")
     tok = open_clip.get_tokenizer("ViT-B-32")
     modele = modele.to(DEVICE).eval()
-    with torch.no_grad():
-        t = modele.encode_text(tok(POSITIFS + NEGATIFS).to(DEVICE)).float()
-        t = t / t.norm(dim=-1, keepdim=True)
+    def textes(liste):
+        with torch.no_grad():
+            t = modele.encode_text(tok(liste).to(DEVICE)).float()
+        return t / t.norm(dim=-1, keepdim=True)
+    t_cig, t_selfie = textes(POSITIFS + NEGATIFS), textes(SELFIE_OUI + SELFIE_NON)
 
     def scorer(images):
-        res = []
+        cig, selfie = [], []
         for i in range(0, len(images), 64):
             lot = torch.stack([pretraitement(Image.fromarray(x)) for x in images[i:i + 64]]).to(DEVICE)
             with torch.no_grad():
                 v = modele.encode_image(lot).float()
                 v = v / v.norm(dim=-1, keepdim=True)
-                p = (100.0 * v @ t.T).softmax(dim=-1)
-            res.append(p[:, :len(POSITIFS)].sum(-1).cpu().numpy())
-        return np.concatenate(res) if res else np.zeros(0)
+                p1 = (100.0 * v @ t_cig.T).softmax(dim=-1)
+                p2 = (100.0 * v @ t_selfie.T).softmax(dim=-1)
+            cig.append(p1[:, :len(POSITIFS)].sum(-1).cpu().numpy())
+            selfie.append(p2[:, :len(SELFIE_OUI)].sum(-1).cpu().numpy())
+        if not cig:
+            return np.zeros(0), np.zeros(0)
+        return np.concatenate(cig), np.concatenate(selfie)
     return scorer
 
 def coupures(images):
@@ -216,7 +264,7 @@ def coupures(images):
     return np.concatenate([[False], diff > 38])
 
 scorer = charger_clip()
-candidats = {}   # vidéo -> liste (score, début, orientation)
+candidats = {}   # vidéo -> liste (priorité, début, orientation, score cigarette, selfie ?)
 ignorees = 0
 for n, chemin in enumerate(VIDEOS, 1):
     try:
@@ -228,19 +276,21 @@ for n, chemin in enumerate(VIDEOS, 1):
         if len(imgs) < 3:
             ignorees += 1
             continue
-        s = scorer(imgs)
+        s, sf = scorer(imgs)
         cut = coupures(imgs)
         fen = int(math.ceil(DUREE_CLIP * FPS_ANALYSE))
         options = []
         for i in range(0, len(imgs) - fen + 1):
             if cut[i + 1:i + fen].any():
                 continue
-            options.append((float(s[i:i + fen].mean()), i / FPS_ANALYSE))
+            cig, selfie = float(s[i:i + fen].mean()), float(sf[i:i + fen].mean())
+            options.append((cig + BONUS_SELFIE * selfie, i / FPS_ANALYSE, cig, selfie >= 0.5))
         options.sort(reverse=True)
         choisis = []
-        for sc, deb in options:   # passages qui ne se chevauchent pas
-            if all(abs(deb - d) >= DUREE_CLIP for _, d, _ in choisis):
-                choisis.append((sc, deb, "portrait" if h > w * 1.05 else "paysage"))
+        orient = "portrait" if h > w * 1.05 else "paysage"
+        for prio, deb, cig, est_selfie in options:   # moments variés qui ne se chevauchent pas
+            if all(abs(deb - c[1]) >= DUREE_CLIP for c in choisis):
+                choisis.append((prio, deb, orient, cig, est_selfie))
             if len(choisis) >= CLIPS_MAX_PAR_VIDEO:
                 break
         candidats[chemin] = choisis
@@ -255,13 +305,13 @@ liberer()
 
 def selection(seuil):
     """Tour par tour entre les vidéos pour varier les personnes."""
-    pools = {k: [c for c in v if c[0] >= seuil] for k, v in candidats.items()}
+    pools = {k: [c for c in v if c[3] >= seuil] for k, v in candidats.items()}
     res, tour = [], 0
     while len(res) < NB_CLIPS_MAX and any(len(p) > tour for p in pools.values()):
         lot = sorted(((p[tour], k) for k, p in pools.items() if len(p) > tour), reverse=True)
         for c, k in lot:
             if len(res) < NB_CLIPS_MAX:
-                res.append((k, c[1], c[2], c[0]))
+                res.append((k, c[1], c[2], c[3], c[4]))   # vidéo, début, orientation, score, selfie
         tour += 1
     return res
 
@@ -270,15 +320,17 @@ CLIPS = selection(seuil)
 while len(CLIPS) < min(24, sum(len(v) for v in candidats.values())) and seuil > 0.05:
     seuil = round(seuil - 0.05, 2)
     CLIPS = selection(seuil)
-journal(f"✂️ {len(CLIPS)} passages retenus (seuil {seuil}), {ignorees} vidéo(s) ignorée(s) (trop courtes ou illisibles)")
+journal(f"✂️ {len(CLIPS)} passages retenus (seuil {seuil}), dont {sum(c[4] for c in CLIPS)} en selfie ; "
+        f"{ignorees} vidéo(s) ignorée(s) (trop courtes ou illisibles)")
 if len(CLIPS) < 8:
-    raise SystemExit("❌ Trop peu de passages utilisables. Ajoute des vidéos (d'au moins 4 secondes) où l'on voit bien la personne fumer.")
+    raise SystemExit(f"❌ Trop peu de passages utilisables. Ajoute des vidéos (d'au moins {DUREE_CLIP + 1:.0f} secondes) où l'on voit bien la cigarette.")
 
 # %%
 # ======================================================================
 #  3. Découper les clips et les décrire avec des mots (BLIP)
 # ======================================================================
-TAILLES = {"paysage": (512, 288), "portrait": (288, 512)}   # (largeur, hauteur) pour l'apprentissage
+TAILLES = ({"paysage": (624, 352), "portrait": (352, 624)} if GROS_GPU
+           else {"paysage": (512, 288), "portrait": (288, 512)})   # (largeur, hauteur) pour l'apprentissage
 if TEST:
     TAILLES = {"paysage": (64, 32), "portrait": (32, 64)}
 
@@ -288,7 +340,7 @@ def charger_legendeur():
     from transformers import BlipProcessor, BlipForConditionalGeneration
     proc = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
     mod = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large",
-                                                       torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32).to(DEVICE)
+                                                       dtype=torch.float16 if DEVICE == "cuda" else torch.float32).to(DEVICE)
 
     def legender(img):
         entree = proc(Image.fromarray(img), "a photograph of", return_tensors="pt").to(DEVICE, mod.dtype)
@@ -298,15 +350,16 @@ def charger_legendeur():
     return legender
 
 legender = charger_legendeur()
-DONNEES = []   # (images uint8 [49,H,W,3], légende)
-for k, (chemin, debut, orient, sc) in enumerate(CLIPS, 1):
+DONNEES = []   # (images uint8 [N,H,W,3], légende, infos)
+for k, (chemin, debut, orient, sc, est_selfie) in enumerate(CLIPS, 1):
     W, H = TAILLES[orient]
     imgs = lire_images(chemin, debut, DUREE_CLIP + 0.5, FPS_CLIP, W, H, nb_max=IMAGES_CLIP)
     if len(imgs) < IMAGES_CLIP:
         continue
     texte = legender(imgs[IMAGES_CLIP // 2])
-    legende = f"{MOT_CLE}, {texte}, {DESCRIPTION_STYLE}"
-    DONNEES.append((imgs, legende))
+    selfie_txt = f"{PHRASE_SELFIE}, " if est_selfie else ""
+    legende = f"{MOT_CLE}, {selfie_txt}{texte}, {DESCRIPTION_STYLE}"
+    DONNEES.append((imgs, legende, f"{os.path.basename(chemin)} @ {debut:.1f}s (score {sc:.2f})"))
     if k % 20 == 0:
         journal(f"   clips préparés : {k}/{len(CLIPS)}")
 del legender
@@ -320,8 +373,8 @@ for i, v in enumerate(vignettes):
     planche.paste(v, ((i % 6) * 160, (i // 6) * 160))
 planche.save(os.path.join(SORTIE, "apercu_passages_choisis.jpg"), quality=85)
 with open(os.path.join(SORTIE, "legendes.txt"), "w", encoding="utf-8") as f:
-    for (chemin, debut, _, sc), (_, leg) in zip(CLIPS, DONNEES):
-        f.write(f"{os.path.basename(chemin)} @ {debut:.1f}s (score {sc:.2f}) : {leg}\n")
+    for _, leg, info in DONNEES:
+        f.write(f"{info} : {leg}\n")
 
 # %%
 # ======================================================================
@@ -345,15 +398,17 @@ def encoder_textes(textes):
         return {t: torch.randn(min(len(t.split()) + 1, MAX_TOKENS), 32, generator=g) for t in textes}
     from transformers import AutoTokenizer, UMT5EncoderModel
     tok = AutoTokenizer.from_pretrained(DOSSIER_MODELE, subfolder="tokenizer")
+    # Grosse carte : encodage rapide sur la carte (bf16). Sinon : sur le processeur (bf16, évite le fp16 du T4).
+    lieu = DEVICE if (GROS_GPU and PRECISION == torch.bfloat16) else "cpu"
     enc = UMT5EncoderModel.from_pretrained(DOSSIER_MODELE, subfolder="text_encoder",
-                                           torch_dtype=torch.bfloat16, low_cpu_mem_usage=True).eval()
+                                           dtype=torch.bfloat16, low_cpu_mem_usage=True).to(lieu).eval()
     res = {}
     for i, t in enumerate(textes, 1):
         e = tok([prompt_clean(t)], max_length=MAX_TOKENS, truncation=True, add_special_tokens=True,
                 return_attention_mask=True, return_tensors="pt")
         with torch.no_grad():
-            h = enc(e.input_ids, e.attention_mask).last_hidden_state[0]
-        res[t] = h.float()
+            h = enc(e.input_ids.to(lieu), e.attention_mask.to(lieu)).last_hidden_state[0]
+        res[t] = h.float().cpu()
         if i % 25 == 0:
             journal(f"   textes encodés : {i}/{len(textes)}")
     del enc
@@ -393,7 +448,7 @@ def vers_latent(imgs):
     return ((z - MOY) / ECART).half()
 
 LATENTS = []   # (latent, légende)
-for i, (imgs, leg) in enumerate(DONNEES, 1):
+for i, (imgs, leg, _) in enumerate(DONNEES, 1):
     LATENTS.append((vers_latent(imgs), leg))
     LATENTS.append((vers_latent(imgs[:, :, ::-1]), leg))   # version miroir : double les exemples
     if i % 20 == 0:
@@ -418,10 +473,9 @@ def charger_transformer():
         WanTransformer3DModel(patch_size=(1, 2, 2), num_attention_heads=2, attention_head_dim=12,
                               in_channels=16, out_channels=16, text_dim=32, freq_dim=32, ffn_dim=32,
                               num_layers=2, rope_max_seq_len=32).save_pretrained(d)
-        return WanTransformer3DModel.from_pretrained(d, torch_dtype=torch.float16 if AMP else torch.float32)
-    return WanTransformer3DModel.from_pretrained(DOSSIER_MODELE, subfolder="transformer", torch_dtype=torch.float16)
+        return WanTransformer3DModel.from_pretrained(d, torch_dtype=PRECISION)
+    return WanTransformer3DModel.from_pretrained(DOSSIER_MODELE, subfolder="transformer", torch_dtype=PRECISION)
 
-AMP = DEVICE == "cuda" or os.environ.get("MANNEQUIN_TEST_FP16") == "1"   # calcul rapide en demi-précision
 transformer = charger_transformer().to(DEVICE)
 transformer.requires_grad_(False)
 transformer.enable_gradient_checkpointing()
@@ -434,7 +488,7 @@ for p in params:
 journal(f"🧠 Module LoRA : {sum(p.numel() for p in params) / 1e6:.1f} M paramètres à apprendre")
 
 optim = torch.optim.AdamW(params, lr=TAUX_APPRENTISSAGE, weight_decay=1e-4)
-scaler = torch.amp.GradScaler(DEVICE, enabled=AMP)
+scaler = torch.amp.GradScaler(DEVICE, enabled=PRECISION == torch.float16)   # utile seulement en fp16
 DECALAGE = 3.0   # décalage du bruit (réglage standard de Wan)
 VIDE = completer(TEXTES[""])
 
@@ -461,10 +515,10 @@ for etape in range(1, ETAPES + 1):
     cible = bruit - z0
     for g in optim.param_groups:
         g["lr"] = TAUX_APPRENTISSAGE * min(1.0, etape / 50)
-    with torch.autocast(DEVICE, dtype=torch.float16, enabled=AMP):
-        pred = transformer(hidden_states=zt.half() if AMP else zt,
+    with torch.autocast(DEVICE, dtype=PRECISION, enabled=AMP):
+        pred = transformer(hidden_states=zt.to(PRECISION),
                            timestep=torch.tensor([sigma * 1000.0], device=DEVICE),
-                           encoder_hidden_states=texte.to(torch.float16 if AMP else torch.float32),
+                           encoder_hidden_states=texte.to(PRECISION),
                            return_dict=False)[0]
     perte = torch.nn.functional.mse_loss(pred.float(), cible)
     if not torch.isfinite(perte):
@@ -515,9 +569,9 @@ def exporter_video(images, chemin, fps=16):
     subprocess.run(cmd, input=imgs.tobytes(), check=True)
 
 transformer.eval()
-if AMP:   # le module appris passe en demi-précision, le reste du modèle ne bouge pas
+if AMP:   # le module appris passe dans la précision du modèle, le reste ne bouge pas
     for p in params:
-        p.data = p.data.half()
+        p.data = p.data.to(PRECISION)
 if TEST:
     planificateur = UniPCMultistepScheduler(prediction_type="flow_prediction", use_flow_sigmas=True,
                                             flow_shift=3.0, num_train_timesteps=1000)

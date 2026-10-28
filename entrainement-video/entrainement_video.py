@@ -72,6 +72,10 @@ import os, sys, subprocess, time, json, math, random, gc, glob, shutil
 DEBUT = time.time()
 TEST = os.environ.get("MANNEQUIN_TEST") == "1"  # mode simulation (utilisé pour vérifier le carnet)
 DUREE_MAX_HEURES = float(os.environ.get("MANNEQUIN_DUREE_MAX_HEURES", DUREE_MAX_HEURES))
+ESSAI_RAPIDE = os.environ.get("MANNEQUIN_ESSAI_RAPIDE") == "1"   # essai technique de quelques minutes
+if ESSAI_RAPIDE:
+    NB_CLIPS_MAX, ETAPES, SAUVEGARDE_TOUTES, SEUIL_FUMER = 6, 30, 15, 0.0
+    PROMPTS_TEST, IMAGES_TEST, ETAPES_TEST = PROMPTS_TEST[:1], 17, 10
 if TEST:
     NB_CLIPS_MAX, ETAPES, SAUVEGARDE_TOUTES, IMAGES_TEST, ETAPES_TEST = 12, 8, 4, 9, 2
     ETAPES = int(os.environ.get("MANNEQUIN_TEST_ETAPES", ETAPES))
@@ -111,7 +115,7 @@ elif DEVICE == "cuda":
 else:
     PRECISION = torch.float32
 AMP = PRECISION != torch.float32
-if GROS_GPU:
+if GROS_GPU and not ESSAI_RAPIDE:
     NB_CLIPS_MAX = max(NB_CLIPS_MAX, 300)
     ETAPES = int(os.environ.get("MANNEQUIN_ETAPES", 2400))
     IMAGES_TEST, ETAPES_TEST = 81, 40
@@ -322,7 +326,7 @@ while len(CLIPS) < min(24, sum(len(v) for v in candidats.values())) and seuil > 
     CLIPS = selection(seuil)
 journal(f"✂️ {len(CLIPS)} passages retenus (seuil {seuil}), dont {sum(c[4] for c in CLIPS)} en selfie ; "
         f"{ignorees} vidéo(s) ignorée(s) (trop courtes ou illisibles)")
-if len(CLIPS) < 8:
+if len(CLIPS) < (2 if ESSAI_RAPIDE else 8):
     raise SystemExit(f"❌ Trop peu de passages utilisables. Ajoute des vidéos (d'au moins {DUREE_CLIP + 1:.0f} secondes) où l'on voit bien la cigarette.")
 
 # %%

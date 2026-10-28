@@ -17,6 +17,7 @@ import os
 import modal
 
 ICI = os.path.dirname(os.path.abspath(__file__))
+GPU = os.environ.get("MANNEQUIN_GPU", "L40S")
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -37,7 +38,7 @@ resultats = modal.Volume.from_name("mannequin-resultats", create_if_missing=True
 cache = modal.Volume.from_name("mannequin-cache", create_if_missing=True)   # modèles téléchargés une seule fois
 
 
-@app.function(gpu="L40S", cpu=8, memory=65536, timeout=24 * 3600,
+@app.function(gpu=GPU, cpu=8, memory=65536, timeout=24 * 3600,
               volumes={"/videos": videos, "/resultats": resultats, "/cache": cache})
 def entrainer(nom_run: str, duree_max_heures: float = 8.0):
     import runpy
@@ -67,6 +68,38 @@ def entrainer(nom_run: str, duree_max_heures: float = 8.0):
         fini.set()
         resultats.commit()
         cache.commit()
+
+
+@app.function(cpu=4, memory=16384, timeout=3 * 3600, volumes={"/cache": cache})
+def precharger():
+    """Télécharge une fois pour toutes les modèles dans le cache (sans carte graphique, presque gratuit)."""
+    from huggingface_hub import snapshot_download
+    snapshot_download("Wan-AI/Wan2.1-T2V-1.3B-Diffusers", allow_patterns=[
+        "model_index.json", "scheduler/*", "tokenizer/*", "text_encoder/*", "vae/*", "transformer/*"])
+    snapshot_download("Salesforce/blip-image-captioning-large")
+    import open_clip
+    open_clip.create_model_and_transforms("ViT-B-32", pretrained="laion2b_s34b_b79k")
+    cache.commit()
+    return "modèles en cache"
+
+
+@app.function(gpu=GPU, timeout=600, volumes={"/cache": cache})
+def verifier():
+    """Vérifie en 1 minute que la carte graphique et les bibliothèques fonctionnent."""
+    import torch, diffusers, peft, transformers
+    from diffusers import WanTransformer3DModel
+    x = torch.randn(2048, 2048, device="cuda", dtype=torch.bfloat16)
+    ok = torch.isfinite(x @ x).all().item()
+    t = WanTransformer3DModel(num_layers=1, num_attention_heads=2, attention_head_dim=64, text_dim=64,
+                              freq_dim=64, ffn_dim=128).to("cuda", torch.bfloat16)
+    y = t(torch.randn(1, 16, 3, 16, 16, device="cuda", dtype=torch.bfloat16),
+          torch.tensor([500.0], device="cuda"), torch.randn(1, 8, 64, device="cuda", dtype=torch.bfloat16),
+          return_dict=False)[0]
+    return {"carte": torch.cuda.get_device_name(0),
+            "memoire_go": round(torch.cuda.get_device_properties(0).total_memory / 2**30),
+            "bf16": torch.cuda.is_bf16_supported(), "calcul_ok": ok and bool(torch.isfinite(y).all()),
+            "torch": torch.__version__, "diffusers": diffusers.__version__,
+            "peft": peft.__version__, "transformers": transformers.__version__}
 
 
 @app.local_entrypoint()
